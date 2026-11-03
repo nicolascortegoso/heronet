@@ -326,6 +326,13 @@ Shows the stream with a box per figure (up to 3, `--max-figures`), its character
 plus the time per model and the frame rate. Keys: `q` quit, `space` pause, `s` save. Options:
 `--size vga`, `--rotate 90`, `--serve 8000` (watch in a browser), `--image file.png` (one image).
 
+Each figure is followed from frame to frame and its answers are combined over the last second
+(`--smooth 1.0`), with confident frames counting more. This matters for side views: there the far
+arm is hidden behind the body, so one frame alone often can't tell `right_up` from `both_down`.
+When the combined arm-position confidence stays below 60% (`--pose-min 0.6`), the label shows
+`?` instead of a guess. A new pose takes about a second to appear; use `--smooth 0.5` for faster
+updates or `--smooth 0` to judge every frame alone.
+
 ### Measure accuracy on real frames
 
 Grab about 2 frames per character and arm position:
@@ -342,6 +349,16 @@ python3 evaluate_live.py live_test --det models/character.pt --pose models/pose.
 
 Reports character, arm-position and combined accuracy, per-class results, the most common
 mistakes (saved as annotated images) and the speed.
+
+To see where the arm-position classifier goes wrong on its validation crops, grouped by viewing
+angle, augmentation and character, with a sheet of the wrong crops:
+
+```bash
+python3 scripts/pose_errors.py pose_crops_multi aug_live --pose models/pose_multi.pt
+```
+
+In HeroNet v2 the mistakes concentrate in the pure side views (90° and 270°, about 30% wrong,
+against about 5% from the front), where one arm is hidden behind the body.
 
 For groups (v2), name each folder after the figures in the frame:
 
@@ -412,6 +429,7 @@ roughly 12–20 fps at 320×240; the bottom line of the window shows the real nu
 | `grab_frames.py` | Save raw frames from the live stream |
 | `live_detect.py` | Live detector + classifier on the stream, window and browser view |
 | `evaluate_live.py` | Accuracy on real labelled frames |
+| `pose_errors.py` | Where the arm-position classifier goes wrong (by angle, augmentation, character) |
 | `export_models.py` | NCNN export for the Raspberry Pi with an agreement check |
 
 Every script has `--help`.

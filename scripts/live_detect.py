@@ -17,10 +17,15 @@ Usage:
   python3 live_detect.py --image photo.png --det ... --pose ...      (one image file)
   python3 live_detect.py <ESP32-IP> --photos --ai --det ...          (full-size photos, slow)
 
+Answers are combined over the last second for each figure (--smooth), so a side view where
+one arm is hidden gets outvoted by clearer views; an arm position the models aren't sure
+about is shown as "?" (--pose-min).
+
 Keys in the window:  q = quit   space = pause/resume   s = save the current frame
 """
 
 import argparse
+from collections import defaultdict
 import http.server
 import os
 import socketserver
@@ -161,6 +166,7 @@ class Recognizer:
         self.det_imgsz, self.pose_imgsz, self.conf = det_imgsz, pose_imgsz, conf
         self.max_figures, self.margin, self.device = max_figures, margin, device
         self.det_ms = self.pose_ms = 0.0
+        self.last_probs = []           # arm-position probabilities of each figure in the last frame
         if verbose:
             print("Characters: " + ", ".join(self.det.names[i] for i in sorted(self.det.names)))
             if self.pose is not None:
@@ -177,6 +183,7 @@ class Recognizer:
         r = self.det.predict(frame, imgsz=self.det_imgsz, conf=self.conf, device=self.device,
                              max_det=self.max_figures, agnostic_nms=True, verbose=False)[0]
         found = []
+        self.last_probs = []
         for b in r.boxes[: self.max_figures]:
             box = [float(v) for v in b.xyxy[0]]
             found.append([box, self.det.names[int(b.cls)], float(b.conf), None, 0.0])
@@ -190,9 +197,64 @@ class Recognizer:
             for f, pr in zip(found, self.pose.predict(crops, imgsz=self.pose_imgsz, device=self.device,
                                                       verbose=False)):
                 f[3], f[4] = self.pose.names[int(pr.probs.top1)], float(pr.probs.top1conf)
+                self.last_probs.append(np.asarray(pr.probs.data.cpu().numpy(), dtype=np.float32))
         t2 = time.perf_counter()
         self.det_ms, self.pose_ms = (t1 - t0) * 1000, (t2 - t1) * 1000
         return found
+
+
+# ----------------------------------------------------------------------------- steadier answers
+
+def _iou(a, b):
+    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = ix * iy
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / union if union > 0 else 0.0
+
+
+class Smoother:
+    """Follows each figure from frame to frame (by box overlap) and combines its answers over
+    the last `window` seconds: a side view, where one arm is hidden, gets outvoted by the clearer
+    views around it. Frames that are more confident count more.
+    The arm position is shown as "?" when the combined confidence stays below `pose_min`."""
+
+    def __init__(self, pose_names, window=1.0, pose_min=0.6):
+        self.names, self.window, self.pose_min = pose_names, window, pose_min
+        self.tracks = []
+
+    def update(self, found, probs, now):
+        for t in self.tracks:
+            t["seen"] = False
+        out = []
+        for i, (box, char, cconf, _, _) in enumerate(found):
+            best = max(self.tracks, key=lambda t: _iou(t["box"], box), default=None)
+            if best is None or best["seen"] or _iou(best["box"], box) < 0.3:
+                best = {"box": box, "hist": []}
+                self.tracks.append(best)
+            best.update(box=box, seen=True, last=now)
+            best["hist"].append((now, char, cconf, probs[i] if i < len(probs) else None))
+            best["hist"] = [h for h in best["hist"] if now - h[0] <= self.window] or best["hist"][-1:]
+            out.append(self._vote(box, best["hist"]))
+        self.tracks = [t for t in self.tracks if now - t["last"] <= self.window]
+        return out
+
+    def _vote(self, box, hist):
+        votes = defaultdict(float)
+        for _, c, cf, _ in hist:
+            votes[c] += cf
+        char = max(votes, key=votes.get)
+        confs = [cf for _, c, cf, _ in hist if c == char]
+        cconf = sum(confs) / len(confs)
+        vecs = [p for *_, p in hist if p is not None]
+        if not vecs:
+            return [box, char, cconf, None, 0.0]
+        weights = [float(v.max()) for v in vecs]                  # confident frames count more
+        avg = sum(w * v for w, v in zip(weights, vecs)) / sum(weights)
+        k = int(avg.argmax())
+        pconf = float(avg[k])
+        pose = self.names[k] if pconf >= self.pose_min else "?"
+        return [box, char, cconf, pose, pconf]
 
 
 # ----------------------------------------------------------------------------- output
@@ -206,7 +268,7 @@ def draw(frame, found, info, scale):
         col = colours[i % len(colours)]
         x0, y0, x1, y1 = (int(v * scale) for v in box)
         cv2.rectangle(view, (x0, y0), (x1, y1), col, 2)
-        label = f"{char} {conf:.0%}" + (f" | {pose} {pconf:.0%}" if pose else "")
+        label = f"{char} {conf:.0%}" + (" | ?" if pose == "?" else f" | {pose} {pconf:.0%}" if pose else "")
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
         ty = max(th + 6, y0)
         cv2.rectangle(view, (x0, ty - th - 6), (x0 + tw + 6, ty), col, -1)
@@ -220,7 +282,8 @@ def draw(frame, found, info, scale):
 def describe(found):
     if not found:
         return "nothing detected"
-    return ", ".join(f"{c} {cf:.0%}" + (f" / {p} {pc:.0%}" if p else "") for _, c, cf, p, pc in found)
+    return ", ".join(f"{c} {cf:.0%}" + (f" / ? ({pc:.0%} sure)" if p == "?" else f" / {p} {pc:.0%}" if p else "")
+                     for _, c, cf, p, pc in found)
 
 
 class BrowserView:
@@ -309,6 +372,10 @@ def main():
     ap.add_argument("--rotate", type=int, choices=[0, 90, 180, 270], default=0, help="rotate camera frames")
     ap.add_argument("--conf", type=float, default=0.4, help="minimum detection confidence (default 0.4)")
     ap.add_argument("--max-figures", type=int, default=3, help="most figures to label per frame (default 3)")
+    ap.add_argument("--smooth", type=float, default=1.0, metavar="SECONDS",
+                    help="combine each figure's answers over this many seconds (default 1.0; 0 = every frame alone)")
+    ap.add_argument("--pose-min", type=float, default=0.6,
+                    help="show the arm position as '?' below this confidence (default 0.6; 0 = always guess)")
     ap.add_argument("--det-imgsz", type=int, default=320, help="detector input size, as trained (default 320)")
     ap.add_argument("--pose-imgsz", type=int, default=224, help="classifier input size, as trained (default 224)")
     ap.add_argument("--margin", type=float, default=0.10, help="crop margin, as in make_pose_crops.py (0.10)")
@@ -334,6 +401,8 @@ def main():
                      args.margin, args.device)
     print("Warming up the models...")
     rec.warmup()
+    pose_names = [rec.pose.names[i] for i in sorted(rec.pose.names)] if rec.pose is not None else []
+    smoother = Smoother(pose_names, 0 if args.image else args.smooth, args.pose_min)
     remover = BackgroundRemover() if args.ai else None
     os.makedirs(args.out, exist_ok=True)
     web = None
@@ -375,7 +444,7 @@ def main():
                     frame = remover(frame)
 
                 t = time.time()
-                found = rec(frame)
+                found = smoother.update(rec(frame), rec.last_probs, time.time())
                 n += 1
                 times = [x for x in times if t - x < 2] + [t]
                 fps = (len(times) - 1) / max(1e-6, t - times[0])
