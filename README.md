@@ -424,7 +424,20 @@ pi/install_launcher.sh                  # English; --lang es for Spanish, --auto
 This puts a **HeroNet** icon on the desktop and in the menu (Games). A double-click opens a
 full-screen window with big labels such as "Batman 95% · left arm up 90%" ("not sure" while the
 arm position is unclear) and a "Waiting for the camera..." screen while the camera is off.
-**Esc** closes it. Add `--no-numbers` in `pi/heronet.sh` to hide the percentages.
+**Esc** closes it.
+
+The camera can be steered from the keyboard while HeroNet runs:
+
+| Key | Action |
+|---|---|
+| ← → | pan the camera left/right (10°) |
+| ↑ ↓ | tilt the camera up/down (10°) |
+| A / D | turn the turntable (15°) |
+| C | centre the camera |
+
+Holding a key down makes one smooth move. If a direction feels reversed, set
+`EXTRA_OPTIONS="--pan-invert"` (or `--tilt-invert`) at the top of `pi/heronet.sh`; `--no-numbers`
+there hides the percentages. The same keys work in the normal `live_detect.py` window.
 
 - If the desktop asks what to do with the file on double-click: File Manager → Edit → Preferences →
   General → tick "Don't ask options on launch executable file".

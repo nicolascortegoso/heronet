@@ -5,6 +5,8 @@
 CAMERA="heronet-cam.local"   # the ESP32-CAM: its name, or its IP address (e.g. 192.168.0.10)
 LANGUAGE="en"                # labels: en (English) or es (español)
 SIZE="vga"                   # stream size: vga (640x480) or qvga (320x240; striped on some cameras)
+EXTRA_OPTIONS=""             # e.g. "--pan-invert" if the left/right arrows move the camera the wrong way,
+                             #      "--tilt-invert" for up/down, "--no-numbers" to hide percentages
 
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$DIR" || exit 1
@@ -36,4 +38,4 @@ POSE=()
 
 echo "$(date '+%F %T') starting: camera $CAMERA ($SIZE), models $MODELS, language $LANGUAGE" >> "$LOG"
 exec python3 scripts/live_detect.py "$CAMERA" --det "$MODELS/det_ncnn_model" "${POSE[@]}" \
-    --size "$SIZE" --kids --lang "$LANGUAGE" "$@" >> "$LOG" 2>&1
+    --size "$SIZE" --kids --lang "$LANGUAGE" $EXTRA_OPTIONS "$@" >> "$LOG" 2>&1

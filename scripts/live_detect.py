@@ -21,7 +21,9 @@ Answers are combined over the last second for each figure (--smooth), so a side 
 one arm is hidden gets outvoted by clearer views; an arm position the models aren't sure
 about is shown as "?" (--pose-min).
 
-Keys in the window:  q = quit   space = pause/resume   s = save the current frame
+Keys in the window:  q / Esc = quit   space = pause/resume   s = save the current frame
+                     arrows = move the camera (pan/tilt)   A / D = turn the turntable
+                     C = centre the camera
 """
 
 import argparse
@@ -257,6 +259,93 @@ class Smoother:
         return [box, char, cconf, pose, pconf]
 
 
+# ----------------------------------------------------------------------------- camera control
+
+# Arrow-key codes from cv2.waitKeyEx differ per system (Linux GTK/Qt, macOS, Windows).
+KEYS_LEFT = {65361, 63234, 2424832, 81}
+KEYS_UP = {65362, 63232, 2490368, 82}
+KEYS_RIGHT = {65363, 63235, 2555904, 83}
+KEYS_DOWN = {65364, 63233, 2621440, 84}
+
+
+class CameraControl:
+    """Moves the ESP32-CAM servos from the keyboard without freezing the picture: key presses
+    are added up and sent in the background (holding a key = one smooth move)."""
+
+    def __init__(self, base_url, pan_step=10, tilt_step=10, turn_step=15, pan_dir=1, tilt_dir=1):
+        self.base = base_url.rstrip("/")
+        self.steps = {"pan": pan_step * pan_dir, "tilt": tilt_step * tilt_dir, "turn": turn_step}
+        self.pending, self.absolute = defaultdict(float), {}
+        self.cond = threading.Condition()
+        self.note, self.note_until = "", 0.0
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def key(self, k):
+        """Handles a key code from cv2.waitKeyEx; returns True if it was a camera key."""
+        low = k & 0xFF
+        moves = {}
+        if k in KEYS_LEFT:
+            moves, note = {"pan": -1}, "camera <"
+        elif k in KEYS_RIGHT:
+            moves, note = {"pan": 1}, "camera >"
+        elif k in KEYS_UP:
+            moves, note = {"tilt": 1}, "camera ^"
+        elif k in KEYS_DOWN:
+            moves, note = {"tilt": -1}, "camera v"
+        elif low in (ord("a"), ord("A")):
+            moves, note = {"turn": -1}, "turntable <"
+        elif low in (ord("d"), ord("D")):
+            moves, note = {"turn": 1}, "turntable >"
+        elif low in (ord("c"), ord("C")):
+            with self.cond:
+                self.pending.pop("pan", None)
+                self.pending.pop("tilt", None)
+                self.absolute.update(pan=90, tilt=90)
+                self.cond.notify()
+            self._show("camera centred")
+            return True
+        else:
+            return False
+        with self.cond:
+            for servo, sign in moves.items():
+                self.absolute.pop(servo, None)
+                self.pending[servo] += sign * self.steps[servo]
+            self.cond.notify()
+        self._show(note)
+        return True
+
+    def _show(self, text):
+        self.note, self.note_until = text, time.time() + 1.2
+
+    def current_note(self):
+        return self.note if time.time() < self.note_until else ""
+
+    def _worker(self):
+        while True:
+            with self.cond:
+                self.cond.wait_for(lambda: self.pending or self.absolute)
+                pending, absolute = dict(self.pending), dict(self.absolute)
+                self.pending.clear()
+                self.absolute.clear()
+            for servo, deg in absolute.items():
+                self._send(f"/angle?servo={servo}&deg={deg:g}")
+            for servo, by in pending.items():
+                if abs(by) >= 0.5:
+                    self._send(f"/angle?servo={servo}&by={by:g}")
+
+    def _send(self, path):
+        try:
+            urllib.request.urlopen(self.base + path, timeout=15).read()
+        except (OSError, ValueError) as e:
+            print(f"  camera control: {e}")
+
+
+def control_url(ip):
+    """Servos answer on the camera's normal port (80), the stream is on 81."""
+    host = ip.split(":")[0] if ip.count(":") == 1 and ip.endswith(":81") else ip
+    return f"http://{host}"
+
+
 # ----------------------------------------------------------------------------- kids mode
 
 NAMES = {
@@ -330,7 +419,7 @@ class KidsView:
                 d.text(((self.size[0] - w) / 2, self.size[1] * y), text, font=font, fill=(255, 255, 255))
         return self._to_bgr(im)
 
-    def frame(self, frame, found):
+    def frame(self, frame, found, note=""):
         from PIL import ImageDraw
         h, w = frame.shape[:2]
         scale = min(self.size[0] / w, self.size[1] / h)
@@ -371,6 +460,10 @@ class KidsView:
             for t, f in lines:
                 d.text((lx + 14, y), t, font=f, fill=(0, 0, 0))
                 y += f.size + 12
+        if note:
+            wn = d.textlength(note, font=self.small)
+            d.rounded_rectangle([16, 16, wn + 48, 16 + self.small.size + 24], radius=12, fill=(20, 24, 40))
+            d.text((32, 26), note, font=self.small, fill=(255, 255, 255))
         if not found:
             msg = self.t["nobody"]
             wmsg = d.textlength(msg, font=self.small)
@@ -514,6 +607,15 @@ def main():
     ap.add_argument("--no-numbers", action="store_true", help="kids mode: hide the percentages")
     ap.add_argument("--lang", choices=["en", "es"], default="en", help="language of the kids-mode labels")
     ap.add_argument("--fullscreen", action="store_true", help="full-screen window")
+    ap.add_argument("--no-controls", action="store_true",
+                    help="don't move the servos from the keyboard (arrows = camera, A/D = turntable, C = centre)")
+    ap.add_argument("--control", metavar="HOST",
+                    help="address for the servo commands (default: the camera address, port 80)")
+    ap.add_argument("--pan-step", type=float, default=10, help="degrees per arrow press, left/right (default 10)")
+    ap.add_argument("--tilt-step", type=float, default=10, help="degrees per arrow press, up/down (default 10)")
+    ap.add_argument("--turn-step", type=float, default=15, help="degrees per A/D press (default 15)")
+    ap.add_argument("--pan-invert", action="store_true", help="swap the left/right arrow directions")
+    ap.add_argument("--tilt-invert", action="store_true", help="swap the up/down arrow directions")
     args = ap.parse_args()
     if args.kids:
         args.fullscreen = True
@@ -560,6 +662,12 @@ def main():
     if show and kids:
         cv2.imshow(title, kids.message(kids.t["waiting"]))
         cv2.waitKey(1)
+    control = None
+    if show and args.ip and not args.image and not args.no_controls:
+        control = CameraControl("http://" + args.control if args.control else control_url(args.ip),
+                                args.pan_step, args.tilt_step, args.turn_step,
+                                -1 if args.pan_invert else 1, -1 if args.tilt_invert else 1)
+        print("Keys: arrows = move the camera, A/D = turn the turntable, C = centre the camera")
     last_id, paused, view, n = 0, False, None, 0
     times, last_print = [], 0.0
     last_frame_t, waiting_shown = time.time(), False
@@ -574,8 +682,11 @@ def main():
                                 cv2.imshow(title, kids.message(kids.t["waiting"], kids.t["hint"]) if kids else
                                            np.full((240, 320, 3), 40, np.uint8))
                                 waiting_shown = True
-                            if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                            k = cv2.waitKeyEx(1)
+                            if k != -1 and (k & 0xFF) in (ord("q"), 27):
                                 break
+                            if k != -1 and control:
+                                control.key(k)
                         continue
                     last_frame_t, waiting_shown = time.time(), False
                 else:
@@ -608,7 +719,9 @@ def main():
                     print(f"[{n}] {describe(found)}   ({info})")
                     last_print = t
                 scale = args.scale or max(1.0, min(4.0, 800 / max(h, w)))
-                view = kids.frame(frame, found) if kids else draw(frame, found, info, scale)
+                note = control.current_note() if control else ""
+                view = (kids.frame(frame, found, note) if kids else
+                        draw(frame, found, info + (f" | {note}" if note else ""), scale))
                 if web:
                     web.publish(view)
 
@@ -624,7 +737,10 @@ def main():
                     break
                 continue
             cv2.imshow(title, view)
-            key = cv2.waitKey(0 if args.image else 1) & 0xFF
+            kx = cv2.waitKeyEx(0 if args.image else 1)
+            if kx != -1 and control and control.key(kx):
+                continue
+            key = kx & 0xFF if kx != -1 else -1
             if key in (ord("q"), 27) or args.image:
                 if args.image:
                     path = os.path.join(args.out, "result_" + os.path.basename(args.image).rsplit(".", 1)[0] + ".jpg")
