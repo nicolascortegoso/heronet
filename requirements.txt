@@ -1,0 +1,15 @@
+# Dataset tools, augmentation, training-set builders
+pillow
+
+# Training, live recognition, evaluation (also installs OpenCV and PyTorch)
+ultralytics
+
+# NCNN export for the Raspberry Pi (export_models.py) and NCNN inference on the Pi
+ncnn
+pnnx
+
+# Optional: AI background removal while capturing (turntable.py --ai)
+# rembg[cpu]
+
+# Optional: uploading the dataset to Hugging Face
+# huggingface_hub

@@ -1,0 +1,10 @@
+folder,name,left_arm,right_arm,description
+both_down,both_down,down,down,"both arms down"
+both_side,both_side,side,side,"both arms straight out to the sides"
+both_up,both_up,up,up,"both arms straight up"
+left_side,left_side,side,down,"left arm straight out to the side, right arm down"
+right_side,right_side,down,side,"right arm straight out to the side, left arm down"
+left_up,left_up,up,down,"left arm straight up, right arm down"
+right_up,right_up,down,up,"right arm straight up, left arm down"
+left_high,left_high,diagonal_up,diagonal_down,"arms tilted: left arm raised diagonally, right arm lowered diagonally"
+right_high,right_high,diagonal_down,diagonal_up,"arms tilted: right arm raised diagonally, left arm lowered diagonally"
