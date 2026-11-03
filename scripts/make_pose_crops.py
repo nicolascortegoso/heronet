@@ -13,7 +13,9 @@ position looks like on any figure. Mirrored images were already relabelled
 (left <-> right) by augment_dataset.py, so train with fliplr=0.
 
 For use on the live stream add --random-bg (and --backgrounds <folder>) and --low-res,
-the same as for the character detector.
+the same as for the character detector. For several figures per frame (HeroNet v2) add
+--neighbours: some crops then show another figure partly in view, as happens live when
+figures stand next to each other.
 
 Needs Pillow:  pip3 install pillow
 
@@ -45,6 +47,43 @@ def class_name(row, scheme):
     return row["arm_position"] if scheme == "pose" else f"{row['character']}__{row['arm_position']}"
 
 
+_POOL = {}
+
+
+def _init_pool(paths_by_split):
+    global _POOL
+    _POOL = paths_by_split
+
+
+def add_neighbour(im, box, split, src, rng, opts):
+    """Puts another figure next to the main one, partly inside the crop: usually behind it,
+    sometimes slightly in front (covering at most ~25% of the main figure)."""
+    with Image.open(os.path.join(src, rng.choice(_POOL[split]))) as n:
+        n = n.convert("RGBA")
+    nb = n.split()[3].point(lambda v: 255 if v >= opts.alpha_min else 0).getbbox()
+    if not nb:
+        return im
+    n = n.crop(nb)
+    mh = box[3] - box[1]
+    f = mh * rng.uniform(0.85, 1.15) / n.size[1]
+    n = n.resize((max(1, round(n.size[0] * f)), max(1, round(n.size[1] * f))), Image.LANCZOS)
+    mw = box[2] - box[0]
+    side = rng.choice((-1, 1))
+    overlap = rng.uniform(0.0, 0.45) * min(mw, n.size[0])        # how far it reaches into the figure
+    x = int(box[2] - overlap) if side > 0 else int(box[0] + overlap - n.size[0])
+    y = int(box[3] - n.size[1] + rng.uniform(-0.05, 0.05) * mh)
+    layer = Image.new("RGBA", im.size, (0, 0, 0, 0))
+    layer.paste(n, (x, y))
+    out = Image.new("RGBA", im.size, (0, 0, 0, 0))
+    if rng.random() < 0.3 and overlap < 0.25 * mw:              # in front
+        out.alpha_composite(im)
+        out.alpha_composite(layer)
+    else:                                                        # behind
+        out.alpha_composite(layer)
+        out.alpha_composite(im)
+    return out
+
+
 def crop_one(job):
     row, src, out, cls, opts, bg_photos = job
     split = "val" if row["split"] == "test" else "train"
@@ -55,6 +94,9 @@ def crop_one(job):
     box = im.split()[3].point(lambda v: 255 if v >= opts.alpha_min else 0).getbbox()
     if not box:
         return None, f"no figure found, skipped: {row['path']}"
+
+    if opts.neighbours and rng.random() < opts.neighbours:
+        im = add_neighbour(im, box, split, src, rng, opts)
 
     # Whole frame first (background + stream degradation), then the crop: same order as live.
     if opts.random_bg:
@@ -112,6 +154,8 @@ def main():
     ap.add_argument("--low-res-prob", type=float, default=0.8, help="share of crops degraded (default 0.8)")
     ap.add_argument("--fig-px", default="80,240",
                     help="with --low-res: figure height range in stream pixels (default 80,240)")
+    ap.add_argument("--neighbours", type=float, default=0.0, metavar="P",
+                    help="share of crops with another figure partly in view (e.g. 0.4; default 0 = off)")
     ap.add_argument("--alpha-min", type=int, default=64, help="alpha from which a pixel counts as figure")
     ap.add_argument("--seed", type=int, default=42, help="random seed")
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 2, help="parallel processes")
@@ -131,7 +175,11 @@ def main():
     print(f"{len(rows)} images -> {args.size}x{args.size} crops, {len(classes)} classes ({args.classes})")
     jobs = [(r, args.src, out, class_name(r, args.classes), args, bg_photos) for r in rows]
     done = []
-    with ProcessPoolExecutor(max_workers=args.workers) as ex:
+    pool = {"train": [r["path"] for r in rows if r["split"] != "test"],
+            "val": [r["path"] for r in rows if r["split"] == "test"]}
+    if args.neighbours:
+        print(f"Neighbours: {args.neighbours:.0%} of crops show another figure partly in view")
+    with ProcessPoolExecutor(max_workers=args.workers, initializer=_init_pool, initargs=(pool,)) as ex:
         for i, (res, err) in enumerate(ex.map(crop_one, jobs, chunksize=16), 1):
             if err:
                 print("  " + err)

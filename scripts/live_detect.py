@@ -175,7 +175,7 @@ class Recognizer:
         """Returns a list of (box, character, conf, pose or None, pose_conf), best first."""
         t0 = time.perf_counter()
         r = self.det.predict(frame, imgsz=self.det_imgsz, conf=self.conf, device=self.device,
-                             max_det=self.max_figures, verbose=False)[0]
+                             max_det=self.max_figures, agnostic_nms=True, verbose=False)[0]
         found = []
         for b in r.boxes[: self.max_figures]:
             box = [float(v) for v in b.xyxy[0]]
@@ -201,13 +201,15 @@ def draw(frame, found, info, scale):
     h, w = frame.shape[:2]
     view = cv2.resize(frame, (int(w * scale), int(h * scale)),
                       interpolation=cv2.INTER_NEAREST if scale >= 2 else cv2.INTER_LINEAR)
-    for box, char, conf, pose, pconf in found:
+    colours = [(0, 200, 0), (255, 160, 0), (0, 140, 255), (200, 0, 200)]     # BGR, one per figure
+    for i, (box, char, conf, pose, pconf) in enumerate(found):
+        col = colours[i % len(colours)]
         x0, y0, x1, y1 = (int(v * scale) for v in box)
-        cv2.rectangle(view, (x0, y0), (x1, y1), (0, 200, 0), 2)
+        cv2.rectangle(view, (x0, y0), (x1, y1), col, 2)
         label = f"{char} {conf:.0%}" + (f" | {pose} {pconf:.0%}" if pose else "")
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
         ty = max(th + 6, y0)
-        cv2.rectangle(view, (x0, ty - th - 6), (x0 + tw + 6, ty), (0, 200, 0), -1)
+        cv2.rectangle(view, (x0, ty - th - 6), (x0 + tw + 6, ty), col, -1)
         cv2.putText(view, label, (x0 + 3, ty - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
     (tw, th), _ = cv2.getTextSize(info, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
     cv2.rectangle(view, (0, view.shape[0] - th - 12), (tw + 12, view.shape[0]), (0, 0, 0), -1)
@@ -306,7 +308,7 @@ def main():
     ap.add_argument("--ai", action="store_true", help="remove the background first (photo/image mode only)")
     ap.add_argument("--rotate", type=int, choices=[0, 90, 180, 270], default=0, help="rotate camera frames")
     ap.add_argument("--conf", type=float, default=0.4, help="minimum detection confidence (default 0.4)")
-    ap.add_argument("--max-figures", type=int, default=1, help="figures to label per frame (default 1)")
+    ap.add_argument("--max-figures", type=int, default=3, help="most figures to label per frame (default 3)")
     ap.add_argument("--det-imgsz", type=int, default=320, help="detector input size, as trained (default 320)")
     ap.add_argument("--pose-imgsz", type=int, default=224, help="classifier input size, as trained (default 224)")
     ap.add_argument("--margin", type=float, default=0.10, help="crop margin, as in make_pose_crops.py (0.10)")

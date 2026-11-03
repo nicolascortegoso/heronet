@@ -11,7 +11,9 @@ of the camera and **what its arms are doing**, live, on a Raspberry Pi.
 - **Dataset:** 792 transparent cutouts, 11 DC characters × 9 arm positions × 8 viewing angles,
   published on Hugging Face: [nicolashr/playmobil-dc-poses](https://huggingface.co/datasets/nicolashr/playmobil-dc-poses)
 - **Models:** YOLO11n detector (character) + YOLO11n classifier (arm position), exported to
-  NCNN for a Raspberry Pi 500
+  NCNN for a Raspberry Pi 500, published on Hugging Face:
+  [nicolashr/heronet](https://huggingface.co/nicolashr/heronet)
+- **v2:** several figures in the same frame, including the same character twice
 
 > **Why this exists:** I built this for my 8-year-old nephew, who loves Playmobil and superheroes.
 > It's a hobby project, made for fun and learning rather than as a polished product, so expect
@@ -283,6 +285,35 @@ Use `device=cpu` without Apple Silicon, or `device=0` with an NVIDIA GPU.
 Find the trained weights with `find runs -name best.pt` and copy them, e.g. to
 `models/character.pt` and `models/pose.pt`.
 
+### 7.5 HeroNet v2: several figures at once
+
+The same photos can teach the models to handle groups. Because the cutouts are transparent,
+`make_yolo_dataset.py --multi` **composes scenes** with 2–4 figures on your empty-scene frames:
+different sizes and positions, sometimes overlapping, sometimes the same character twice (from
+different photos). Each box covers only the visible part of its figure, and every figure keeps at
+least 40% visible. Training scenes use only training photos; validation scenes only test photos.
+
+```bash
+python3 make_yolo_dataset.py aug_live yolo_char_multi --classes character \
+    --random-bg --backgrounds empty_scene --white-fraction 0.1 --low-res --negatives empty_scene \
+    --multi 4000
+
+python3 make_pose_crops.py aug_live pose_crops_multi \
+    --random-bg --backgrounds empty_scene --white-fraction 0.1 --low-res --neighbours 0.4
+
+yolo detect train data=yolo_char_multi/data.yaml model=yolo11n.pt imgsz=320 epochs=60 device=mps project=runs name=character_multi
+yolo classify train data=pose_crops_multi model=yolo11n-cls.pt imgsz=224 epochs=50 fliplr=0 device=mps project=runs name=pose_multi
+```
+
+- `--multi 4000` adds 4000 group scenes to the single-figure images (`--max-per-scene`,
+  `--repeat-prob`, `--min-visible` tune them). Check `preview_boxes.jpg`: half of it shows scenes.
+- `--neighbours 0.4`: 40% of the arm-position crops show another figure partly in view, as happens
+  live when figures stand side by side.
+- When the figures stand on the white background (the turntable fits only one), grab a few
+  empty-scene frames of that area too.
+- With several figures each one is smaller in the frame: if arm positions suffer, use
+  `--size vga` live.
+
 ---
 
 ## 8. Testing live
@@ -291,9 +322,9 @@ Find the trained weights with `find runs -name best.pt` and copy them, e.g. to
 python3 live_detect.py 192.168.0.10 --det models/character.pt --pose models/pose.pt
 ```
 
-Shows the stream with the box, character and arm position, plus the time per model and the
-frame rate. Keys: `q` quit, `space` pause, `s` save. Options: `--size vga`, `--rotate 90`,
-`--serve 8000` (watch in a browser), `--image file.png` (one image).
+Shows the stream with a box per figure (up to 3, `--max-figures`), its character and arm position,
+plus the time per model and the frame rate. Keys: `q` quit, `space` pause, `s` save. Options:
+`--size vga`, `--rotate 90`, `--serve 8000` (watch in a browser), `--image file.png` (one image).
 
 ### Measure accuracy on real frames
 
@@ -311,6 +342,17 @@ python3 evaluate_live.py live_test --det models/character.pt --pose models/pose.
 
 Reports character, arm-position and combined accuracy, per-class results, the most common
 mistakes (saved as annotated images) and the speed.
+
+For groups (v2), name each folder after the figures in the frame:
+
+```bash
+python3 grab_frames.py 192.168.0.10 live_test_multi/batman+joker --count 3 --enter
+python3 grab_frames.py 192.168.0.10 live_test_multi/batman+batman+robin --count 3 --enter
+python3 evaluate_live.py live_test_multi --multi --det models/character_multi.pt --pose models/pose_multi.pt
+```
+
+Reports how many frames got exactly the right characters, figure-level recall and precision,
+frames with too few or too many boxes, and the most common mistakes.
 
 ---
 
@@ -390,12 +432,14 @@ Every script has `--help`.
 | `zsh: no matches found` | zsh refuses globs that match nothing; use `find runs -name best.pt` |
 | Trained models not in `runs/` | They are saved relative to the folder `yolo` was run from |
 | Left/right arm positions confused | Classifier trained without `fliplr=0` |
+| Two figures get one box, or extra boxes appear | Train the v2 detector (`--multi`); try `--size vga` |
 | Figure touches the photo edge | Turntable base in the cutout: `--cut-below 0.80` |
 
 ---
 
 ## Licence
 
-Code: MIT (see [`LICENSE`](LICENSE)). Dataset: CC BY 4.0, on Hugging Face.
+Code: MIT (see [`LICENSE`](LICENSE)). Dataset: CC BY 4.0, on Hugging Face. Trained models:
+AGPL-3.0, as they are trained from Ultralytics YOLO11 (AGPL-3.0).
 Playmobil is a trademark of geobra Brandstätter Stiftung & Co. KG; the characters are trademarks
 of DC Comics. This project is not affiliated with or endorsed by either.

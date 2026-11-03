@@ -22,6 +22,11 @@ For a model that runs on the live camera stream (no background removal), use:
     --negatives <folder> frames of the empty scene (grab_frames.py): added with no boxes,
                          so the detector learns "no figure here"
 
+Several figures per image (HeroNet v2):
+    --multi N            add N scenes with 2-4 figures each (sometimes the same character
+                         twice, sometimes overlapping). Boxes cover only the visible part of
+                         each figure; every figure stays at least --min-visible visible.
+
 The "test" split of augment_dataset.py becomes YOLO's "val" split.
 
 Needs Pillow:  pip3 install pillow
@@ -92,6 +97,109 @@ def convert(job):
     return (split, f"{stem}.{opts.format}", cls_id), None
 
 
+# ----------------------------------------------------------------------------- multi-figure scenes
+
+_SCENE_ROWS = {}
+
+
+def _init_scenes(rows_by_split):
+    global _SCENE_ROWS
+    _SCENE_ROWS = rows_by_split
+
+
+def _cutout(src, row, alpha_min):
+    """The figure of one augmented image, cropped to its visible pixels."""
+    with Image.open(os.path.join(src, row["path"])) as im:
+        im = im.convert("RGBA")
+    box = im.split()[3].point(lambda v: 255 if v >= alpha_min else 0).getbbox()
+    return im.crop(box) if box else None
+
+
+def make_scene(job):
+    """One image with several figures on a background. Returns (split, file name, class ids) or None."""
+    idx, split, src, out, ids, opts, bg_photos = job
+    rng = fx.seeded_rng(opts.seed, f"scene:{split}:{idx}")
+    pool = _SCENE_ROWS[split]
+    W, H = opts.scene_size
+    k = rng.choice([n for n in (2, 2, 3, 3, 4) if n <= opts.max_per_scene] or [1])
+
+    picks = []
+    for _ in range(k):
+        if picks and rng.random() < opts.repeat_prob:      # same character again, another photo
+            same = [r for r in pool if r["character"] == picks[-1]["character"]]
+            picks.append(rng.choice(same))
+        else:
+            picks.append(rng.choice(pool))
+
+    base_h = rng.uniform(0.35, 0.8) * H / (1 + 0.15 * (k - 1))       # more figures -> a bit smaller
+    figs = []
+    for r in picks:
+        cut = _cutout(src, r, opts.alpha_min)
+        if cut is None:
+            return None
+        h = base_h * rng.uniform(0.85, 1.15)
+        f = h / cut.size[1]
+        if cut.size[0] * f > W * 0.6:
+            f = W * 0.6 / cut.size[0]
+        figs.append((r, cut.resize((max(1, round(cut.size[0] * f)), max(1, round(cut.size[1] * f))),
+                                   Image.LANCZOS)))
+
+    # Place them; retry until every figure keeps at least min_visible of its pixels visible.
+    for _ in range(30):
+        layers, masks = [], []
+        ground = rng.uniform(0.6, 0.98) * H
+        for r, fig in figs:
+            fw, fh = fig.size
+            x = rng.randint(-fw // 6, max(-fw // 6, W - fw + fw // 6))
+            y = int(min(H - fh * 0.85, max(0, ground - fh + rng.uniform(-0.08, 0.08) * H)))
+            layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+            layer.paste(fig, (x, y))
+            layers.append(layer)
+            masks.append(layer.split()[3].point(lambda v: 255 if v >= opts.alpha_min else 0))
+        boxes, ok = [], True
+        for i, m in enumerate(masks):
+            full = m.histogram()[255]
+            if full == 0:
+                ok = False
+                break
+            visible = m
+            for later in masks[i + 1:]:                     # figures pasted later are in front
+                visible = fx.ImageChops.subtract(visible, later)
+            vis = visible.histogram()[255]
+            if vis < opts.min_visible * full:
+                ok = False
+                break
+            boxes.append(visible.getbbox())
+        if ok:
+            break
+    else:
+        return None
+
+    bg = (fx.random_background((W, H), rng, bg_photos, opts.white_fraction, opts.bg)
+          if opts.random_bg else Image.new("RGB", (W, H), opts.bg))
+    canvas = bg.convert("RGBA")
+    for layer in layers:
+        canvas.alpha_composite(layer)
+    img = canvas.convert("RGB")
+    if opts.low_res and rng.random() < opts.low_res_prob:
+        heights = sorted(b[3] - b[1] for b in boxes)
+        img, _ = fx.low_res(img, rng, heights[len(heights) // 2], opts.fig_px)
+
+    stem = f"scene_{split}_{idx:05d}"
+    path = os.path.join(out, "images", split, f"{stem}.{opts.format}")
+    if opts.format == "png":
+        img.save(path, compress_level=6)
+    else:
+        img.save(path, quality=opts.quality)
+    cls_ids = []
+    with open(os.path.join(out, "labels", split, stem + ".txt"), "w") as f:
+        for (r, _), (x0, y0, x1, y1) in zip(figs, boxes):
+            c = ids[class_name(r, opts.classes)]
+            cls_ids.append(c)
+            f.write(f"{c} {(x0 + x1) / 2 / W:.6f} {(y0 + y1) / 2 / H:.6f} {(x1 - x0) / W:.6f} {(y1 - y0) / H:.6f}\n")
+    return split, f"{stem}.{opts.format}", cls_ids
+
+
 def make_negative(job):
     """Variants of one empty-scene frame, saved with an empty label file (= no figure)."""
     path, idx, out, opts = job
@@ -124,26 +232,31 @@ def make_negative(job):
     return results
 
 
-def preview(out, done, names, n=24, cols=6, cell=200, seed=0):
+def preview(out, done, names, n=24, cols=6, cell=200, seed=0, scenes=()):
     rng = random.Random(seed)
     pick = rng.sample(done, min(n, len(done)))
+    if scenes:                                   # half of the preview shows multi-figure scenes
+        pick = pick[: n // 2] + rng.sample(list(scenes), min(n - n // 2, len(scenes)))
     sheet = Image.new("RGB", (cols * cell, math.ceil(len(pick) / cols) * (cell + 18)), (255, 255, 255))
     d = ImageDraw.Draw(sheet)
-    for i, (split, fname, cls_id) in enumerate(pick):
+    colours = [(255, 0, 0), (0, 160, 255), (0, 190, 0), (255, 140, 0)]
+    for i, (split, fname, _) in enumerate(pick):
         stem = fname.rsplit(".", 1)[0]
         with Image.open(os.path.join(out, "images", split, fname)) as im:
             im = im.convert("RGB")
             w, h = im.size
             with open(os.path.join(out, "labels", split, stem + ".txt")) as f:
-                _, cx, cy, bw, bh = f.read().split()
-            cx, cy, bw, bh = (float(v) for v in (cx, cy, bw, bh))
+                lines = [ln.split() for ln in f if ln.strip()]
             dd = ImageDraw.Draw(im)
-            dd.rectangle([(cx - bw / 2) * w, (cy - bh / 2) * h, (cx + bw / 2) * w, (cy + bh / 2) * h],
-                         outline=(255, 0, 0), width=max(2, w // 150))
-            im = im.resize((cell - 6, cell - 6))
+            for j, (_, cx, cy, bw, bh) in enumerate(lines):
+                cx, cy, bw, bh = (float(v) for v in (cx, cy, bw, bh))
+                dd.rectangle([(cx - bw / 2) * w, (cy - bh / 2) * h, (cx + bw / 2) * w, (cy + bh / 2) * h],
+                             outline=colours[j % len(colours)], width=max(2, w // 150))
+            label = " + ".join(names[int(ln[0])] for ln in lines)
+            im.thumbnail((cell - 6, cell - 6))
         x, y = (i % cols) * cell, (i // cols) * (cell + 18)
         sheet.paste(im, (x + 3, y + 3))
-        d.text((x + 4, y + cell - 2), names[cls_id][:34], fill=(0, 0, 0))
+        d.text((x + 4, y + cell - 2), label[:34], fill=(0, 0, 0))
     path = os.path.join(out, "preview_boxes.jpg")
     sheet.save(path, quality=88)
     return path
@@ -173,6 +286,14 @@ def main():
                     help="variants per empty-scene frame (default 4)")
     ap.add_argument("--negative-val", type=float, default=0.2,
                     help="share of empty-scene frames used for validation (default 0.2)")
+    ap.add_argument("--multi", type=int, default=0, metavar="N",
+                    help="add N scenes with several figures each (default 0 = one figure per image)")
+    ap.add_argument("--max-per-scene", type=int, default=4, help="most figures in a scene (default 4)")
+    ap.add_argument("--repeat-prob", type=float, default=0.25,
+                    help="chance that a scene repeats a character already in it (default 0.25)")
+    ap.add_argument("--min-visible", type=float, default=0.4,
+                    help="every figure in a scene keeps at least this share visible (default 0.4)")
+    ap.add_argument("--scene-size", default="640,480", help="scene size W,H (default 640,480, like the camera)")
     ap.add_argument("--format", choices=["png", "jpg"], default="png", help="image format (default png)")
     ap.add_argument("--quality", type=int, default=92, help="JPEG quality, only with --format jpg (default 92)")
     ap.add_argument("--alpha-min", type=int, default=64,
@@ -187,6 +308,7 @@ def main():
     rows = list(csv.DictReader(open(labels_csv)))
     args.bg = tuple(int(v) for v in args.background.split(","))
     args.fig_px = tuple(float(v) for v in args.fig_px.split(","))
+    args.scene_size = tuple(int(v) for v in args.scene_size.split(","))
     bg_photos = fx.load_backgrounds(args.backgrounds) if args.random_bg else []
     if args.backgrounds and not args.random_bg:
         print("Note: --backgrounds is only used together with --random-bg")
@@ -214,6 +336,24 @@ def main():
             if i % 500 == 0 or i == len(jobs):
                 print(f"  {i}/{len(jobs)} images done")
 
+    scenes = []
+    if args.multi:
+        by_split = {"train": [r for r in rows if r["split"] != "test"],
+                    "val": [r for r in rows if r["split"] == "test"]}
+        n_val = round(args.multi * 0.2) if by_split["val"] else 0
+        jobs = [(i, "train", args.src, out, ids, args, bg_photos) for i in range(args.multi - n_val)]
+        jobs += [(i, "val", args.src, out, ids, args, bg_photos) for i in range(n_val)]
+        with ProcessPoolExecutor(max_workers=args.workers, initializer=_init_scenes, initargs=(by_split,)) as ex:
+            for i, res in enumerate(ex.map(make_scene, jobs, chunksize=8), 1):
+                if res:
+                    scenes.append(res)
+                if i % 500 == 0 or i == len(jobs):
+                    print(f"  {i}/{len(jobs)} multi-figure scenes done")
+        figs = sum(len(c) for _, _, c in scenes)
+        dup = sum(len(c) != len(set(c)) for _, _, c in scenes)
+        print(f"  {len(scenes)} scenes with {figs} figures ({figs / max(1, len(scenes)):.1f} per scene), "
+              f"{dup} with the same character twice")
+
     neg = {"train": 0, "val": 0}
     if args.negatives:
         neg_paths = fx.load_backgrounds(args.negatives)
@@ -233,17 +373,20 @@ def main():
     counts = {"train": {}, "val": {}}
     for split, _, c in done:
         counts[split][c] = counts[split].get(c, 0) + 1
+    for split, _, cs in scenes:
+        for c in cs:
+            counts[split][c] = counts[split].get(c, 0) + 1
     tr, va = sum(counts["train"].values()), sum(counts["val"].values())
-    print(f"\nTrain: {tr} images, val: {va} images" + (f" (+ {neg['train']} / {neg['val']} empty)" if args.negatives else ""))
+    print(f"\nFigures: {tr} train, {va} val" + (f" (+ {neg['train']} / {neg['val']} empty images)" if args.negatives else ""))
     missing_val = [names[i] for i in range(len(names)) if i not in counts["val"]]
     if missing_val:
         print(f"  Note: {len(missing_val)} classes have no val images (few photos per class): "
               + ", ".join(missing_val[:8]) + (" ..." if len(missing_val) > 8 else ""))
     lo = min(counts["train"].get(i, 0) for i in range(len(names)))
     hi = max(counts["train"].get(i, 0) for i in range(len(names)))
-    print(f"  Train images per class: {lo} to {hi}")
+    print(f"  Train figures per class: {lo} to {hi}")
     print(f"\nDataset: {out}\nConfig:  {os.path.join(out, 'data.yaml')}")
-    print(f"Preview: {preview(out, done, names)}")
+    print(f"Preview: {preview(out, done, names, scenes=scenes)}")
     flip = " fliplr=0" if args.classes != "character" else ""
     print("\nTrain with:  yolo detect train data=" + os.path.join(out, "data.yaml")
           + f" model=yolo11n.pt imgsz=320 epochs=60{flip}")

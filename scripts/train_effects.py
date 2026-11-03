@@ -11,7 +11,7 @@ import io
 import os
 import random
 
-from PIL import Image, ImageDraw, ImageFilter, ImageEnhance
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageEnhance
 
 IMAGE_EXT = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
 

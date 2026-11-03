@@ -8,8 +8,13 @@ Reports character accuracy, arm-position accuracy, both together, frames where n
 figure was found, the most common mistakes and the speed. Every wrong frame is saved,
 annotated, to <out>/ so you can see what went wrong.
 
+Several figures per frame (--multi): frames in folders named after the figures they show,
+    <folder>/batman+joker/*.jpg     <folder>/batman+batman+robin/*.jpg
+Reports how many frames got exactly the right characters, and figure-level recall/precision.
+
 Usage:
   python3 evaluate_live.py live_test --det <detector> --pose <classifier>
+  python3 evaluate_live.py live_test_multi --multi --det <detector> --pose <classifier>
   python3 evaluate_live.py live_test --det det_ncnn_model --pose pose_ncnn_model   (on the Pi)
 """
 
@@ -26,6 +31,73 @@ import cv2  # noqa: E402
 EXT = (".jpg", ".jpeg", ".png", ".bmp")
 
 
+def evaluate_multi(a, rec):
+    items = []
+    for d in sorted(os.listdir(a.folder)):
+        ddir = os.path.join(a.folder, d)
+        if os.path.isdir(ddir) and not d.startswith((".", "_")):
+            want = Counter(x for x in d.split("+") if x)
+            items += [(os.path.join(ddir, f), want) for f in sorted(os.listdir(ddir)) if f.lower().endswith(EXT)]
+    if not items:
+        sys.exit(f"No frames found. Expected {a.folder}/<character>+<character>/*.jpg")
+    names_c = set(rec.det.names.values())
+    unknown = sorted({c for _, w in items for c in w if c not in names_c})
+    if unknown:
+        print("WARNING: not classes of the detector (always counted missing): " + ", ".join(unknown))
+    rec.warmup()
+    os.makedirs(a.out, exist_ok=True)
+    exact = expected = predicted = matched = too_few = too_many = 0
+    per_char = defaultdict(lambda: [0, 0])                # found, expected
+    confusions = Counter()
+    det_ms, pose_ms = [], []
+    for path, want in items:
+        img = cv2.imread(path)
+        if img is None:
+            print(f"  can't read {path}")
+            continue
+        found = rec(img)
+        det_ms.append(rec.det_ms)
+        if found and rec.pose is not None:
+            pose_ms.append(rec.pose_ms / len(found))
+        got = Counter(f[1] for f in found)
+        hit = sum((got & want).values())
+        matched += hit
+        expected += sum(want.values())
+        predicted += sum(got.values())
+        exact += got == want
+        too_few += sum(got.values()) < sum(want.values())
+        too_many += sum(got.values()) > sum(want.values())
+        for c, k in want.items():
+            per_char[c][0] += min(k, got[c])
+            per_char[c][1] += k
+        missing, extra = want - got, got - want
+        for m in missing.elements():
+            confusions[(m, next(iter(extra.elements()), "(nothing)"))] += 1
+        if got != want:
+            view = draw(img, found, "truth: " + " + ".join(sorted(want.elements())), 2.0)
+            cv2.imwrite(os.path.join(a.out, "MULTI__" + "+".join(sorted(want.elements())) + "__"
+                                     + os.path.basename(path)), view)
+    n = len(det_ms)
+    print(f"\n{n} real frames with several figures ({expected} figures)")
+    print(f"  exactly right characters: {exact}/{n}  ({exact / max(1, n):.1%})")
+    print(f"  figures found (recall):   {matched}/{expected}  ({matched / max(1, expected):.1%})")
+    print(f"  boxes correct (precision):{matched:>4}/{predicted}  ({matched / max(1, predicted):.1%})")
+    print(f"  frames with too few boxes: {too_few}, too many: {too_many}")
+    print(f"\n{'character':<16}{'found':>10}")
+    for c in sorted(per_char):
+        ok, tot = per_char[c]
+        print(f"{c:<16}{ok:>5}/{tot:<4}")
+    if confusions:
+        print("\nMost common mistakes (expected -> got instead):")
+        for (t, g), k in confusions.most_common(8):
+            print(f"  {t} -> {g}: {k}")
+    avg = lambda v: sum(v) / max(1, len(v))
+    print(f"\nSpeed: detector {avg(det_ms):.0f} ms per frame"
+          + (f", classifier {avg(pose_ms):.0f} ms per figure" if pose_ms else ""))
+    if exact < n:
+        print(f"Mistakes saved in {os.path.abspath(a.out)}/")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Accuracy of the live models on real labelled camera frames.")
     ap.add_argument("folder", help="<folder>/<character>/<arm_position>/*.jpg")
@@ -37,7 +109,14 @@ def main():
     ap.add_argument("--margin", type=float, default=0.10)
     ap.add_argument("--device", default=None)
     ap.add_argument("--out", default="live_eval_errors", help="folder for the annotated mistakes")
+    ap.add_argument("--multi", action="store_true",
+                    help="frames with several figures, in folders like batman+joker/")
+    ap.add_argument("--max-figures", type=int, default=6, help="with --multi: most boxes per frame (default 6)")
     a = ap.parse_args()
+    if a.multi:
+        rec = Recognizer(a.det, a.pose, a.det_imgsz, a.pose_imgsz, a.conf, a.max_figures, a.margin, a.device)
+        evaluate_multi(a, rec)
+        return
 
     items = []
     for c in sorted(os.listdir(a.folder)):
