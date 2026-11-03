@@ -100,7 +100,7 @@ Sketch: [`firmware/esp32cam_turntable/esp32cam_turntable.ino`](firmware/esp32cam
 
 | Address | What it does |
 |---|---|
-| `http://<ip>/` | Test page: live view, take a photo, buttons for all three servos |
+| `http://<ip>/` | Test page: live view, take a photo, buttons for all three servos. Also `http://heronet-cam.local/` |
 | `http://<ip>/capture` | One full-resolution photo (1600×1200 JPEG) |
 | `http://<ip>/angle?deg=90` | Turntable servo to 90° (0–180) |
 | `http://<ip>/angle?deg=90&servo=tilt` | Tilt servo to 90° |
@@ -411,6 +411,29 @@ python3 live_detect.py 192.168.0.10 --det pi_models/det_ncnn_model --pose pi_mod
 The window opens on the Pi's screen; `http://<pi-ip>:8000` shows the same in any browser. Without
 a screen (SSH) the script runs headless automatically. Expected speed on the Pi 5 CPU with NCNN is
 roughly 12–20 fps at 320×240; the bottom line of the window shows the real numbers.
+
+### One-click start (for kids)
+
+The ESP32-CAM announces itself on the network as **`heronet-cam.local`**, so nothing needs to know
+its IP address. On the Pi, once (from `~/heronet`):
+
+```bash
+pi/install_launcher.sh                  # English; --lang es for Spanish, --autostart to start with the Pi
+```
+
+This puts a **HeroNet** icon on the desktop and in the menu (Games). A double-click opens a
+full-screen window with big labels such as "Batman 95% · left arm up 90%" ("not sure" while the
+arm position is unclear) and a "Waiting for the camera..." screen while the camera is off.
+**Esc** closes it. Add `--no-numbers` in `pi/heronet.sh` to hide the percentages.
+
+- If the desktop asks what to do with the file on double-click: File Manager → Edit → Preferences →
+  General → tick "Don't ask options on launch executable file".
+- Settings live at the top of `pi/heronet.sh` (`CAMERA`, `LANGUAGE`); problems are written to
+  `heronet.log`.
+- `pi/install_launcher.sh --remove` takes the icon away again.
+
+The same view is available anywhere with
+`python3 scripts/live_detect.py heronet-cam.local --det ... --pose ... --kids`.
 
 ---
 

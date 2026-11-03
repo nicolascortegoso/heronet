@@ -20,3 +20,4 @@ __pycache__/
 *.pyc
 .venv/
 .DS_Store
+pose_errors.jpg

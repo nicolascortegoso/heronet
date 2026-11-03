@@ -20,6 +20,10 @@
 #include "esp_camera.h"
 #include <WiFi.h>
 #include <WebServer.h>
+#include <ESPmDNS.h>
+
+// The board also answers at http://heronet-cam.local/ (no need to know its IP address).
+const char* HOSTNAME = "heronet-cam";
 
 const char* WIFI_SSID = "YOUR_SSID";
 const char* WIFI_PASS = "YOUR_PASSWORD";
@@ -344,11 +348,16 @@ void setup() {
   }
 
   WiFi.mode(WIFI_STA);
+  WiFi.setHostname(HOSTNAME);
   WiFi.setSleep(WIFI_POWER_SAVE);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.print("Connecting to Wi-Fi");
   while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
   Serial.printf("\nOpen http://%s/\n", WiFi.localIP().toString().c_str());
+  if (MDNS.begin(HOSTNAME)) {
+    MDNS.addService("http", "tcp", 80);
+    Serial.printf("      or http://%s.local/\n", HOSTNAME);
+  }
 
   server.on("/", handleRoot);
   server.on("/capture", handleCapture);

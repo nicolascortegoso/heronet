@@ -257,6 +257,129 @@ class Smoother:
         return [box, char, cconf, pose, pconf]
 
 
+# ----------------------------------------------------------------------------- kids mode
+
+NAMES = {
+    "en": {"aquaman": "Aquaman", "batman": "Batman", "blackadam": "Black Adam", "catwoman": "Catwoman",
+           "cyborg": "Cyborg", "harleyquinn": "Harley Quinn", "joker": "Joker", "riddler": "Riddler",
+           "robin": "Robin", "supergirl": "Supergirl", "wonderwoman": "Wonder Woman"},
+    "es": {"aquaman": "Aquaman", "batman": "Batman", "blackadam": "Black Adam", "catwoman": "Gatúbela",
+           "cyborg": "Cyborg", "harleyquinn": "Harley Quinn", "joker": "Guasón", "riddler": "Acertijo",
+           "robin": "Robin", "supergirl": "Supergirl", "wonderwoman": "Mujer Maravilla"},
+}
+POSES = {
+    "en": {"both_down": "arms down", "both_side": "arms out", "both_up": "arms up",
+           "left_side": "left arm out", "right_side": "right arm out", "left_up": "left arm up",
+           "right_up": "right arm up", "left_high": "left arm high", "right_high": "right arm high"},
+    "es": {"both_down": "brazos abajo", "both_side": "brazos estirados", "both_up": "brazos arriba",
+           "left_side": "brazo izquierdo estirado", "right_side": "brazo derecho estirado",
+           "left_up": "brazo izquierdo arriba", "right_up": "brazo derecho arriba",
+           "left_high": "brazo izquierdo más alto", "right_high": "brazo derecho más alto"},
+}
+TEXTS = {
+    "en": {"starting": "Getting ready...", "waiting": "Waiting for the camera...", "hint": "Is the camera switched on?", "unsure": "not sure",
+           "nobody": "Show me a hero!"},
+    "es": {"starting": "Preparando...", "waiting": "Esperando la cámara...", "hint": "¿Está prendida la cámara?", "unsure": "no sé",
+           "nobody": "¡Mostrame un superhéroe!"},
+}
+
+
+def _font(size):
+    from PIL import ImageFont
+    for name in ("DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                 "Arial Bold.ttf", "/System/Library/Fonts/Supplemental/Arial Bold.ttf", "Arial.ttf"):
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            pass
+    return ImageFont.load_default()
+
+
+class KidsView:
+    """Big friendly labels ("Batman" / "left arm up"), no numbers, a waiting screen."""
+
+    def __init__(self, lang="en", width=1280, height=960, numbers=True):
+        self.lang, self.size, self.numbers = lang, (width, height), numbers
+        self.big, self.small = _font(54), _font(36)
+        self.t = TEXTS[lang]
+
+    def name(self, char):
+        return NAMES[self.lang].get(char, char.replace("_", " ").title())
+
+    def pose(self, pose):
+        if pose is None:
+            return None
+        if pose == "?":
+            return self.t["unsure"]
+        return POSES[self.lang].get(pose, pose.replace("_", " "))
+
+    def _to_pil(self, bgr):
+        from PIL import Image
+        return Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+
+    def _to_bgr(self, im):
+        return cv2.cvtColor(np.array(im), cv2.COLOR_RGB2BGR)
+
+    def message(self, line1, line2=""):
+        from PIL import Image, ImageDraw
+        im = Image.new("RGB", self.size, (20, 24, 40))
+        d = ImageDraw.Draw(im)
+        for text, font, y in ((line1, self.big, 0.42), (line2, self.small, 0.56)):
+            if text:
+                w = d.textlength(text, font=font)
+                d.text(((self.size[0] - w) / 2, self.size[1] * y), text, font=font, fill=(255, 255, 255))
+        return self._to_bgr(im)
+
+    def frame(self, frame, found):
+        from PIL import ImageDraw
+        h, w = frame.shape[:2]
+        scale = min(self.size[0] / w, self.size[1] / h)
+        big = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LINEAR)
+        im = self._to_pil(big)
+        d = ImageDraw.Draw(im)
+        colours = [(40, 200, 60), (255, 170, 0), (0, 150, 255), (220, 60, 220)]
+        placed = []
+        # Draw all boxes first, then the labels, so no box line crosses a label.
+        for i, (box, *_rest) in enumerate(found):
+            d.rounded_rectangle([v * scale for v in box], radius=12, outline=colours[i % len(colours)], width=6)
+        for i, (box, char, cconf, pose, pconf) in enumerate(found):
+            col = colours[i % len(colours)]
+            x0, y0, x1, y1 = (v * scale for v in box)
+            pct = lambda c: f"  {c:.0%}" if self.numbers else ""
+            lines = [(self.name(char) + pct(cconf), self.big)]
+            if self.pose(pose):
+                lines.append((self.pose(pose) + pct(pconf), self.small))
+            tw = max(d.textlength(t, font=f) for t, f in lines) + 28
+            th = sum(f.size + 12 for _, f in lines) + 12
+            lx = min(max(0, x0), im.size[0] - tw)
+            # First free spot: above the box, inside its top, below it, then further up/down.
+            cands = [y0 - th - 8, y0 + 8, y1 + 8] + [y0 - th - 8 - k * (th + 8) for k in range(1, 4)] \
+                + [y1 + 8 + k * (th + 8) for k in range(1, 4)]
+            ly = None
+            for cy in cands:
+                if cy < 0 or cy + th > im.size[1]:
+                    continue
+                r = (lx, cy, lx + tw, cy + th)
+                if not any(r[0] < q[2] and q[0] < r[2] and r[1] < q[3] and q[1] < r[3] for q in placed):
+                    ly = cy
+                    break
+            if ly is None:
+                ly = max(0, min(y0 + 8, im.size[1] - th))
+            placed.append((lx, ly, lx + tw, ly + th))
+            d.rounded_rectangle([lx, ly, lx + tw, ly + th], radius=14, fill=col)
+            y = ly + 10
+            for t, f in lines:
+                d.text((lx + 14, y), t, font=f, fill=(0, 0, 0))
+                y += f.size + 12
+        if not found:
+            msg = self.t["nobody"]
+            wmsg = d.textlength(msg, font=self.small)
+            d.rounded_rectangle([(im.size[0] - wmsg) / 2 - 20, im.size[1] - 80, (im.size[0] + wmsg) / 2 + 20,
+                                 im.size[1] - 20], radius=14, fill=(20, 24, 40))
+            d.text(((im.size[0] - wmsg) / 2, im.size[1] - 72), msg, font=self.small, fill=(255, 255, 255))
+        return self._to_bgr(im)
+
+
 # ----------------------------------------------------------------------------- output
 
 def draw(frame, found, info, scale):
@@ -386,7 +509,14 @@ def main():
     ap.add_argument("--out", default="live_results", help="folder for saved frames")
     ap.add_argument("--no-window", action="store_true", help="no window (e.g. over SSH): print / serve only")
     ap.add_argument("--timeout", type=float, default=10, help="camera timeout in seconds")
+    ap.add_argument("--kids", action="store_true",
+                    help="full screen, big friendly labels; Esc quits (for the double-click launcher)")
+    ap.add_argument("--no-numbers", action="store_true", help="kids mode: hide the percentages")
+    ap.add_argument("--lang", choices=["en", "es"], default="en", help="language of the kids-mode labels")
+    ap.add_argument("--fullscreen", action="store_true", help="full-screen window")
     args = ap.parse_args()
+    if args.kids:
+        args.fullscreen = True
     if not args.image and not args.ip:
         sys.exit("Give the ESP32-CAM IP address, or --image <file>.")
     if args.ai and not (args.photos or args.image):
@@ -396,6 +526,16 @@ def main():
     if show and not has_display():
         print("No screen found (SSH session?): running without a window. Use --serve to watch in a browser.")
         show = False
+
+    title = "HeroNet" if args.kids else "live_detect (q quit, space pause, s save)"
+    kids = KidsView(args.lang, numbers=not args.no_numbers) if args.kids else None
+    if show:
+        cv2.namedWindow(title, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+        if args.fullscreen:
+            cv2.setWindowProperty(title, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        if kids:
+            cv2.imshow(title, kids.message(kids.t["starting"]))
+            cv2.waitKey(1)
 
     rec = Recognizer(args.det, args.pose, args.det_imgsz, args.pose_imgsz, args.conf, args.max_figures,
                      args.margin, args.device)
@@ -417,18 +557,27 @@ def main():
         reader = StreamReader(url, args.timeout)
         reader.start()
 
-    title = "live_detect (q quit, space pause, s save)"
+    if show and kids:
+        cv2.imshow(title, kids.message(kids.t["waiting"]))
+        cv2.waitKey(1)
     last_id, paused, view, n = 0, False, None, 0
     times, last_print = [], 0.0
+    last_frame_t, waiting_shown = time.time(), False
     try:
         while True:
             if not paused or view is None:
                 if reader:
-                    frame, _, last_id = reader.latest(last_id)
+                    frame, _, last_id = reader.latest(last_id, timeout=0.5)
                     if frame is None:
-                        if show and cv2.waitKey(1) & 0xFF == ord("q"):
-                            break
+                        if show:
+                            if time.time() - last_frame_t > 3 and not waiting_shown:   # camera off or gone
+                                cv2.imshow(title, kids.message(kids.t["waiting"], kids.t["hint"]) if kids else
+                                           np.full((240, 320, 3), 40, np.uint8))
+                                waiting_shown = True
+                            if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                                break
                         continue
+                    last_frame_t, waiting_shown = time.time(), False
                 else:
                     try:
                         frame = cv2.imread(args.image) if args.image else grab_photo(args.ip, args.timeout)
@@ -459,7 +608,7 @@ def main():
                     print(f"[{n}] {describe(found)}   ({info})")
                     last_print = t
                 scale = args.scale or max(1.0, min(4.0, 800 / max(h, w)))
-                view = draw(frame, found, info, scale)
+                view = kids.frame(frame, found) if kids else draw(frame, found, info, scale)
                 if web:
                     web.publish(view)
 
@@ -476,7 +625,7 @@ def main():
                 continue
             cv2.imshow(title, view)
             key = cv2.waitKey(0 if args.image else 1) & 0xFF
-            if key == ord("q") or args.image:
+            if key in (ord("q"), 27) or args.image:
                 if args.image:
                     path = os.path.join(args.out, "result_" + os.path.basename(args.image).rsplit(".", 1)[0] + ".jpg")
                     cv2.imwrite(path, view)
