@@ -4,6 +4,7 @@
 # Settings (change here, or run install_launcher.sh again with --camera / --lang):
 CAMERA="heronet-cam.local"   # the ESP32-CAM: its name, or its IP address (e.g. 192.168.0.10)
 LANGUAGE="en"                # labels: en (English) or es (español)
+SIZE="vga"                   # stream size: vga (640x480) or qvga (320x240; striped on some cameras)
 
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$DIR" || exit 1
@@ -33,6 +34,6 @@ fi
 POSE=()
 [ -d "$MODELS/pose_ncnn_model" ] && POSE=(--pose "$MODELS/pose_ncnn_model")
 
-echo "$(date '+%F %T') starting: camera $CAMERA, models $MODELS, language $LANGUAGE" >> "$LOG"
+echo "$(date '+%F %T') starting: camera $CAMERA ($SIZE), models $MODELS, language $LANGUAGE" >> "$LOG"
 exec python3 scripts/live_detect.py "$CAMERA" --det "$MODELS/det_ncnn_model" "${POSE[@]}" \
-    --kids --lang "$LANGUAGE" "$@" >> "$LOG" 2>&1
+    --size "$SIZE" --kids --lang "$LANGUAGE" "$@" >> "$LOG" 2>&1
